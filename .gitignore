@@ -1,0 +1,10 @@
+token.txt
+images/*
+venv
+.venv
+*.json
+*.png
+*.jpg
+*.jpeg
+*.mp4
+*.gif
