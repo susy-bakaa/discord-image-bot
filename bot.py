@@ -1,7 +1,8 @@
 import os, re, json
 import random
 import asyncio
-from datetime import datetime, timezone
+import hashlib, zipfile
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Optional
 
@@ -11,11 +12,16 @@ from discord.ext import commands
 from discord.ext import tasks
 
 # ----- Config -----
-TOKEN = os.getenv("DISCORD_TOKEN")  # set this in your environment
+TOKEN = os.getenv("DISCORD_TOKEN")
 IMAGES_DIR = Path(os.getenv("IMAGES_DIR", "images"))
 DAILY_DB = Path(os.getenv("DAILY_DB", "daily.json"))
 IMAGES_DB = Path(os.getenv("IMAGES_DB", "images_db.json"))
 USAGE_DB  = Path(os.getenv("USAGE_DB",  "usage.json"))
+
+# Export config (set these in your env/service)
+EXPORT_DIR = Path(os.getenv("EXPORT_DIR", ""))
+EXPORT_BASE_URL = os.getenv("EXPORT_BASE_URL", "")
+EXPORT_RETENTION_DAYS = int(os.getenv("EXPORT_RETENTION_DAYS", "7"))
 
 # Back-compat: accept either single GUILD_ID or multi GUILD_IDS
 _single = os.getenv("GUILD_ID", "").strip()
@@ -34,15 +40,14 @@ ADMIN_USER_IDS = {int(x) for x in os.getenv("ADMIN_USER_IDS", "").replace(" ", "
 CONFIG_GUILD_ID = int(os.getenv("CONFIG_GUILD_ID", "0"))
 CONFIG_GUILD = discord.Object(id=CONFIG_GUILD_ID) if CONFIG_GUILD_ID else None
 
-SYNCED = False  # put at module top
-RARITIES = ["Common", "Uncommon", "Rare", "Mythical"]
+SYNCED = False
 MAX_DAILY_RANDOM = int(os.getenv("MAX_DAILY_RANDOM", "3"))
+RARITIES = ["Common", "Uncommon", "Rare", "Mythical", "Exquisite"]
+ALLOWED_EXT = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".mp4", ".webm", ".mov"}
 
 # Reset rolls at midnight UTC by default (consistent for everyone)
 def today_key() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d")
-
-ALLOWED_EXT = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".mp4", ".webm", ".mov"}
 
 # ----- Helpers -----
 def load_images() -> list[Path]:
@@ -79,6 +84,11 @@ def save_daily_db(db: dict) -> None:
     tmp.write_text(json.dumps(db, indent=2), encoding="utf-8")
     tmp.replace(DAILY_DB)
 
+def _sha256_bytes(b: bytes) -> str:
+    h = hashlib.sha256()
+    h.update(b)
+    return h.hexdigest()
+
 def pick_or_get_today(images: Optional[list[Path]] = None) -> Path:
     images = images or list_pool_images()
     if not images:
@@ -103,8 +113,9 @@ async def send_image(interaction: discord.Interaction, path: Path, title: str):
 
 # --- Image metadata
 def _images_db():
-    db = _load_json(IMAGES_DB, {"images": {}})
+    db = _load_json(IMAGES_DB, {"images": {}, "hashes": {}})  # <-- ensure hashes index exists
     if "images" not in db: db["images"] = {}
+    if "hashes" not in db: db["hashes"] = {}
     return db
 
 def get_meta(p: Path) -> dict:
@@ -117,7 +128,7 @@ def get_meta(p: Path) -> dict:
         _save_json(IMAGES_DB, db)
     return rec
 
-def set_meta(p: Path, *, rarity: Optional[str] = None, blacklisted: Optional[bool] = None) -> dict:
+def set_meta(p: Path, *, rarity: Optional[str] = None, blacklisted: Optional[bool] = None, sha256: Optional[str] = None) -> dict:
     db = _images_db()
     key = str(p.resolve())
     rec = db["images"].get(key) or {"rarity": "Common", "blacklisted": False}
@@ -127,6 +138,9 @@ def set_meta(p: Path, *, rarity: Optional[str] = None, blacklisted: Optional[boo
         rec["rarity"] = rarity
     if blacklisted is not None:
         rec["blacklisted"] = bool(blacklisted)
+    if sha256 is not None:
+        rec["sha256"] = sha256
+        db["hashes"][sha256] = key  # index for duplicate detection
     db["images"][key] = rec
     _save_json(IMAGES_DB, db)
     return rec
@@ -204,6 +218,10 @@ async def on_ready():
         await bot.change_presence(status=discord.Status.online, activity=_presence_variants()[0])
     rotate_presence.start()
 
+    # Start export purging task
+    if not purge_exports.is_running():
+        purge_exports.start()
+
     # Sync commands
     global SYNCED
     if not SYNCED:
@@ -213,7 +231,7 @@ async def on_ready():
                 # - For config guild: DO NOT clear. Copy globals + sync (keeps dev cmds).
                 # - For other guilds: copy globals + sync (as before).
                 if CONFIG_GUILD and gobj.id == CONFIG_GUILD.id:
-                    bot.tree.copy_global_to(guild=gobj)  # <-- added so /daily & /random appear there too
+                    bot.tree.copy_global_to(guild=gobj)
                     cmds = await bot.tree.sync(guild=gobj)
                 else:
                     bot.tree.copy_global_to(guild=gobj)
@@ -221,7 +239,6 @@ async def on_ready():
                 print(f"Synced {len(cmds)} cmds to guild {gobj.id}: {[c.name for c in cmds]}")
             print(f"Synced to {len(MY_GUILDS)} guild(s).")
         else:
-            # Fallback: global sync (slow to appear; not recommended)
             cmds = await bot.tree.sync()
             print(f"Synced {len(cmds)} global cmds: {[c.name for c in cmds]}")
         SYNCED = True
@@ -244,6 +261,23 @@ async def on_guild_join(guild: discord.Guild):
         bot.tree.copy_global_to(guild=gobj)
         cmds = await bot.tree.sync(guild=gobj)
     print(f"Synced {len(cmds)} cmds to newly allowed guild {guild.id}")
+
+@tasks.loop(hours=1)
+async def purge_exports():
+    try:
+        if not EXPORT_DIR or not EXPORT_DIR.exists():
+            return
+        cutoff = datetime.now(timezone.utc) - timedelta(days=EXPORT_RETENTION_DAYS)
+        for p in EXPORT_DIR.glob("export-*.zip"):
+            mtime = datetime.fromtimestamp(p.stat().st_mtime, tz=timezone.utc)
+            if mtime < cutoff:
+                try:
+                    p.unlink()
+                    print(f"purge_exports: deleted old {p.name}")
+                except Exception as e:
+                    print(f"purge_exports: failed to delete {p}: {e}")
+    except Exception as e:
+        print(f"purge_exports error: {e}")
 
 # --- Public commands @app_commands.guilds(*MY_GUILDS)
 @bot.tree.command(name="daily", description="Send today's picture (same for everyone).")
@@ -388,14 +422,24 @@ async def cfg_upload(interaction: discord.Interaction, file: discord.Attachment,
         if file.size > 8 * 1024 * 1024:
             await interaction.followup.send("File too large (>8 MB).", ephemeral=True); return
 
+        # Read into memory for hashing
+        raw = await file.read()
+        sha = _sha256_bytes(raw)
+
+        # Duplicate check via hash index
+        db = _images_db()
+        dup_path = db.get("hashes", {}).get(sha)
+        if dup_path and Path(dup_path).exists():
+            await interaction.followup.send(f"❌ Duplicate file detected. Already uploaded as **{Path(dup_path).name}**.", ephemeral=True)
+            return
+
         # Ensure we can write to the images dir
         IMAGES_DIR.mkdir(parents=True, exist_ok=True)
         probe = IMAGES_DIR / "._writetest"
         probe.write_text("ok", encoding="utf-8")
         probe.unlink(missing_ok=True)
 
-        # Read & save
-        raw = await file.read()
+        # Sanitize and ensure unique filename
         safe = re.sub(r"[^A-Za-z0-9._-]", "_", file.filename)
         dest = IMAGES_DIR / safe
         i = 1
@@ -407,10 +451,8 @@ async def cfg_upload(interaction: discord.Interaction, file: discord.Attachment,
         print(f"/cfg_upload saving to {dest} ({file.size} bytes)")
         dest.write_bytes(raw)
 
-        # Register + rarity
-        meta = get_meta(dest)
-        if rarity:
-            meta = set_meta(dest, rarity=rarity.value)
+        # Register + rarity + sha256
+        meta = set_meta(dest, rarity=(rarity.value if rarity else None), sha256=sha)
 
         await interaction.followup.send(
             f"✅ Uploaded: **{dest.name}**\nrarity: **{meta['rarity']}** • blacklisted: **{meta['blacklisted']}**",
@@ -425,6 +467,98 @@ async def cfg_upload(interaction: discord.Interaction, file: discord.Attachment,
             await interaction.followup.send(f"❌ Upload failed: {e}", ephemeral=True)
         except Exception:
             pass
+
+@bot.tree.command(name="cfg_export", description="Create a ZIP of all media and publish a link.", guild=CONFIG_GUILD)
+async def cfg_export(interaction: discord.Interaction):
+    if not _is_admin(interaction):
+        await interaction.response.send_message("Not allowed.", ephemeral=True); return
+    try:
+        await interaction.response.defer(ephemeral=True, thinking=True)
+
+        if not EXPORT_DIR or not EXPORT_BASE_URL:
+            await interaction.followup.send("❌ EXPORT_DIR / EXPORT_BASE_URL not configured.", ephemeral=True); return
+
+        if not EXPORT_DIR.exists():
+            EXPORT_DIR.mkdir(parents=True, exist_ok=True)
+
+        items = list_all_images()
+        if not items:
+            await interaction.followup.send("No media to export.", ephemeral=True); return
+
+        ts = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+        zip_name = f"export-{ts}.zip"
+        tmp_zip = (IMAGES_DIR / f".{zip_name}")  # temp in images dir
+        final_zip = EXPORT_DIR / zip_name
+
+        # Create zip
+        with zipfile.ZipFile(tmp_zip, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            for p in items:
+                # store relative to IMAGES_DIR
+                arcname = p.relative_to(IMAGES_DIR)
+                zf.write(p, arcname)
+
+        # Move to export dir
+        tmp_zip.replace(final_zip)
+
+        url = f"{EXPORT_BASE_URL.rstrip('/')}/{zip_name}"
+        await interaction.followup.send(f"✅ Export ready: {url}", ephemeral=True)
+    except Exception as e:
+        import traceback
+        print("cfg_export failed:", "".join(traceback.format_exception_only(type(e), e)).strip())
+        try:
+            await interaction.followup.send(f"❌ Export failed: {e}", ephemeral=True)
+        except Exception:
+            pass
+
+
+@bot.tree.command(name="cfg_rehash", description="Compute hashes for existing media so duplicates can be detected.", guild=CONFIG_GUILD)
+async def cfg_rehash(interaction: discord.Interaction):
+    if not _is_admin(interaction):
+        await interaction.response.send_message("Not allowed.", ephemeral=True); return
+    try:
+        await interaction.response.defer(ephemeral=True, thinking=True)
+
+        items = list_all_images()
+        if not items:
+            await interaction.followup.send("No media found.", ephemeral=True); return
+
+        updated = 0
+        dup_hits = 0
+
+        # We’ll use your existing helpers and set_meta(), which also maintains the hash index.
+        for p in items:
+            rec = get_meta(p)
+            if rec.get("sha256"):
+                continue  # already hashed
+
+            try:
+                raw = p.read_bytes()
+            except Exception as e:
+                print(f"cfg_rehash: failed to read {p}: {e}")
+                continue
+
+            sha = _sha256_bytes(raw)
+
+            # Count if another file already registered this hash
+            db = _images_db()
+            if db.get("hashes", {}).get(sha) and db["hashes"][sha] != str(p.resolve()):
+                dup_hits += 1
+
+            set_meta(p, sha256=sha)  # stores sha and updates the hash index
+            updated += 1
+
+        await interaction.followup.send(
+            f"✅ Rehashed {updated} file(s). Found {dup_hits} duplicate signature(s) already present.",
+            ephemeral=True
+        )
+    except Exception as e:
+        import traceback
+        print("cfg_rehash failed:", "".join(traceback.format_exception_only(type(e), e)).strip())
+        try:
+            await interaction.followup.send(f"❌ Rehash failed: {e}", ephemeral=True)
+        except Exception:
+            pass
+
 
 if __name__ == "__main__":
     if not TOKEN:
